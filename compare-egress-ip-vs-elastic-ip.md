@@ -24,7 +24,24 @@ Elastic IP (EIP), Huawei Cloud'da **statik public IP adresleri ve olceklenebilir
 | **Yonetim** | `EgressIP` Custom Resource (CR) ile Kubernetes-native yonetim |
 | **Node Secimi** | `k8s.ovn.org/egress-assignable=""` etiketi ile isaretlenen node'lara otomatik atama |
 | **Trafik Akisi** | Secilen pod'larin trafigi, egress IP atanmis node uzerinden yonlendirilir |
-| **Failover** | Egress IP tasiyan node basarisiz olursa, IP otomatik olarak baska bir uygun node'a tasinir |
+| **Failover** | Egress IP tasiyan node basarisiz olursa, IP otomatik olarak baska bir uygun node'a tasinir (~2 saniye) |
+
+**Detayli Trafik Akisi (OVN-Kubernetes):**
+1. Pod, cluster disi bir hedefe trafik gonderir
+2. OVN-Kubernetes, pod'un EgressIP selector'una uygun oldugunu tespit eder
+3. OVN logical router **reroute policies** (oncelik 102) trafigi egress node'a yonlendirir
+4. Egress node'da OVN northbound database'deki **SNAT kurali** kaynak IP'yi pod IP'den egress IP'ye degistirir
+5. Trafik, egress IP kaynak adresi ile node'dan cikar
+
+**OVN SNAT Kaydi Ornegi:**
+```
+_uuid: 385dd68c-62a2-4394-a3ef-6b86afc3ed43
+external_ip: "192.168.126.100"
+logical_ip: "10.129.3.232"
+type: "snat"
+```
+
+> **Kaynak:** [OVN-Kubernetes EgressIP Docs](https://ovn-kubernetes.io/features/cluster-egress-controls/egress-ip/)
 
 ### Huawei Cloud CCE EIP
 
@@ -70,7 +87,31 @@ spec:
 - `spec.namespaceSelector`: Hedef namespace'leri secen label selector
 - `spec.podSelector`: (Opsiyonel) Belirli pod'lari secen label selector
 
-> **Kaynak:** [OpenShift Docs - EgressIP Object](https://github.com/openshift/openshift-docs/blob/main/modules/nw-egress-ips-object.adoc)
+**Node Atama Kurallari (OVN-Kubernetes):**
+- Bir egress IP ayni anda **yalnizca bir node'a** atanir
+- Egress IP'ler uygun node'lar arasinda **esit dagilimla** dengelenir
+- Birden fazla egress IP tanimlanmissa, **tek bir node birden fazla IP barindirmaz** (HA icin)
+- Yalnizca **worker node'lar** uygundur - control plane node'lar haric tutulur
+
+**Cloud Provider Node Annotation'i:**
+Cloud platformlarinda `cloud.network.openshift.io/egress-ipconfig` annotation'i node basina kapasite ve subnet bilgisi saglar.
+
+**Legacy OpenShift SDN Konfigurasyonu (oc patch):**
+```bash
+# Namespace'e egress IP atama
+oc patch netnamespace <proje_adi> --type=merge \
+  -p '{"egressIPs": ["192.168.1.100"]}'
+
+# Node'da izin verilen CIDR araligini tanimlama (otomatik atama)
+oc patch hostsubnet <node_adi> --type=merge \
+  -p '{"egressCIDRs": ["192.168.1.0/24"]}'
+
+# veya Manuel atama
+oc patch hostsubnet <node_adi> --type=merge \
+  -p '{"egressIPs": ["192.168.1.100"]}'
+```
+
+> **Kaynak:** [OpenShift Docs - EgressIP Object](https://github.com/openshift/openshift-docs/blob/main/modules/nw-egress-ips-object.adoc), [Red Hat Blog - How to Enable Static Egress IP](https://www.redhat.com/en/blog/how-enable-static-egress-ip-red-hat-openshift-container-platform)
 
 ### Huawei Cloud CCE EIP
 
@@ -187,10 +228,15 @@ spec:
 ### OpenShift Egress IP
 - **Control plane node'larinda desteklenmez**
 - Uygulama ve ingress pod'lari ayni node'da ise, route kaynakli istekler icin egress IP uygulanmaz
+- Egress IP'ler node'un **birincil ag arayuzunde ek IP** olarak uygulanir; ayni subnet'te olmalidir (bare metal secondary NIC harici)
 - Linux ag konfigurasyion dosyalarinda tanimlanmamalidir
-- Public cloud'larda node basina atanabilecek IP siniri vardir (AWS: instance tipine gore, GCP: 100/node, Azure: 256/NIC)
+- Public cloud'larda node basina atanabilecek IP siniri vardir (AWS: 30-50, GCP: 10/node, Azure: 256/NIC)
 - Tum trafigi tek bir node'a yonlendirmek performans sorunlarina yol acabilir
 - Hatali label selector tum namespace'lerin cikis IP'sini degistirebilir
+- **OpenShift SDN:** Namespace'ler arasi egress IP paylasimi desteklenmez; otomatik ve manuel atama ayni node'da karistirilamaz
+- **OpenShift SDN:** Egress IP tanimli ancak hicbir node tarafindan barindirılmayan bir namespace'in **cikis trafigi duser (drop)**
+- **RHOSP:** Failover sirasinda Neutron reservation port yeniden olusturulur, floating IP iliskisi kopar - manuel yeniden atama gerekir
+- Bagimsiz ovn-controller islemesi nedeniyle, pod trafigi egress node'a SNAT kurallarindan once ulasabilir (kisa sureli race condition)
 
 ### Huawei Cloud CCE EIP
 - Her EIP ayni anda yalnizca **bir kaynaga** baglanabilir
@@ -246,15 +292,27 @@ spec:
 
 | Spesifikasyon | Deger |
 |---------------|-------|
-| **CNI Eklentisi** | OVN-Kubernetes (veya OpenShift SDN) |
-| **CRD** | `EgressIP` (k8s.ovn.org/v1) |
+| **CNI Eklentisi** | OVN-Kubernetes (varsayilan OCP 4.6+) veya OpenShift SDN (legacy) |
+| **CRD / API Grubu** | `EgressIP` (`k8s.ovn.org/v1`) |
 | **Node Etiketi** | `k8s.ovn.org/egress-assignable=""` |
+| **Cloud Annotation** | `cloud.network.openshift.io/egress-ipconfig` |
+| **Host CIDR Annotation** | `k8s.ovn.org/host-cidrs` (secondary NIC icin, yalnizca bare metal) |
 | **IP Protokolu** | IPv4 + IPv6 (Dual-Stack) |
-| **AWS IP Limiti** | Instance tipine gore degisir |
-| **GCP IP Limiti** | Node basina 100 alias, VPC basina ~15.000 |
+| **OVN Health Check Portu** | 9107 |
+| **Failover Gecikmesi** | ~2 saniye (OCPBUGS-32161 duzeltmesi sonrasi) |
+| **P99 Baslangic Gecikmesi (24K EIP)** | 8.4 ms |
+| **Olcek Testi** | 24.000 egress IP, 120 node cluster, worker basina 200 EIP |
+| **AWS IP Limiti** | Instance tipine gore 30-50 (degisken) |
+| **GCP IP Limiti** | Node basina 10 alias, VPC basina ~15.000 |
 | **Azure IP Limiti** | NIC basina 256, sanal ag basina 65.536 |
-| **Failover** | Otomatik (OVN-Kubernetes yonetiminde) |
 | **Scope** | Cluster-scoped kaynak |
+| **Minimum Versiyon** | OCP 4.10 (cloud destegi), OCP 4.6 (OVN-Kubernetes varsayilan) |
+| **OpenShift SDN Otomatik Mod** | Namespace basina 1 egress IP |
+| **OpenShift SDN Manuel Mod** | Namespace basina birden fazla egress IP |
+| **OVN-Kubernetes** | Namespace'ler arasi IP paylasimi destekli |
+| **Ikincil NIC Destegi** | Yalnizca bare metal |
+
+> **Kaynak:** [Red Hat Developer Blog - Egress IP Scale Testing](https://developers.redhat.com/blog/2024/06/21/egress-ip-scale-testing-openshift-container-platform)
 
 ### Huawei Cloud CCE EIP
 
@@ -289,7 +347,21 @@ spec:
 
 ---
 
-## 12. Ozet
+## 12. Failover Davranisi Karsilastirmasi
+
+| Kriter | OpenShift Egress IP | Huawei CCE EIP |
+|--------|---------------------|----------------|
+| **Mekanizma** | OVN port 9107 uzerinden health check; basarisiz node tespit edilir | Cloud altyapisi tarafindan yonetilir |
+| **Failover Suresi** | ~2 saniye | Cloud SLA'ya bagli |
+| **Otomatik Yeniden Atama** | Evet - IP baska uygun node'a tasinir | Pod EIP: pod yeniden zamanlandiginda EIP korunur (mevcut EIP); otomatik EIP: yeniden olusturulur |
+| **Yeniden Dengeleme** | Node geri geldiginde IP'ler yeniden dengelenir | Uygulanmaz - EIP kaynak bazinda sabit |
+| **Birden Fazla IP** | Pod ilk IP'yi kullanir; basarisiz olursa sonrakine gecer | Her pod/node tek EIP; NAT Gateway'de EIP degisikligi gerekmez |
+
+> **Kaynak:** [Red Hat Developer Blog - Egress IP Scale Testing](https://developers.redhat.com/blog/2024/06/21/egress-ip-scale-testing-openshift-container-platform)
+
+---
+
+## 13. Ozet
 
 **OpenShift Egress IP**, Kubernetes-native bir cozum olarak cluster icinde tanimlanan CRD'ler araciligiyla yonetilir ve ozellikle coklu platform destegi, namespace/pod bazinda ince granularite ve otomatik failover sunmasi ile one cikar. Ek bir cloud servisi gerektirmez.
 
@@ -301,12 +373,19 @@ Her iki cozum de ayni temel ihtiyaci karsilar: **konteyner trafiginiin dis dunya
 
 ## Kaynaklar
 
+### OpenShift Egress IP
 1. [OpenShift Documentation - Configuring Egress IPs (OVN-Kubernetes)](https://docs.openshift.com/container-platform/4.15/networking/ovn_kubernetes_network_provider/configuring-egress-ips-ovn.html)
 2. [OpenShift Docs Source - nw-egress-ips-about.adoc](https://github.com/openshift/openshift-docs/blob/main/modules/nw-egress-ips-about.adoc)
 3. [OpenShift Docs Source - nw-egress-ips-object.adoc](https://github.com/openshift/openshift-docs/blob/main/modules/nw-egress-ips-object.adoc)
 4. [OpenShift Docs Source - nw-egress-ips-node.adoc](https://github.com/openshift/openshift-docs/blob/main/modules/nw-egress-ips-node.adoc)
-5. [Huawei Cloud - EIP Product Description](https://support.huaweicloud.com/intl/en-us/productdesc-eip/overview_0001.html)
-6. [Huawei Cloud - CCE Pod Internet Access](https://support.huaweicloud.com/intl/en-us/usermanual-cce/cce_10_0400.html)
-7. [Huawei Cloud - Configuring EIP for Pod in CCE Turbo](https://support.huaweicloud.com/intl/en-us/usermanual-cce/cce_10_0734.html)
-8. [Huawei Cloud - Cloud Native Network 2.0](https://support.huaweicloud.com/intl/en-us/usermanual-cce/cce_10_0284.html)
-9. [Huawei Cloud - CCE Networking Overview](https://support.huaweicloud.com/intl/en-us/usermanual-cce/cce_10_0249.html)
+5. [Red Hat Developer Blog - Egress IP Scale Testing in OpenShift](https://developers.redhat.com/blog/2024/06/21/egress-ip-scale-testing-openshift-container-platform)
+6. [Red Hat Blog - How to Enable Static Egress IP](https://www.redhat.com/en/blog/how-enable-static-egress-ip-red-hat-openshift-container-platform)
+7. [OVN-Kubernetes Upstream Docs - EgressIP](https://ovn-kubernetes.io/features/cluster-egress-controls/egress-ip/)
+8. [OVN-Kubernetes EgressIP Source (GitHub)](https://github.com/openshift/ovn-kubernetes/blob/master/docs/features/cluster-egress-controls/egress-ip.md)
+
+### Huawei Cloud CCE EIP
+9. [Huawei Cloud - EIP Product Description](https://support.huaweicloud.com/intl/en-us/productdesc-eip/overview_0001.html)
+10. [Huawei Cloud - CCE Pod Internet Access](https://support.huaweicloud.com/intl/en-us/usermanual-cce/cce_10_0400.html)
+11. [Huawei Cloud - Configuring EIP for Pod in CCE Turbo](https://support.huaweicloud.com/intl/en-us/usermanual-cce/cce_10_0734.html)
+12. [Huawei Cloud - Cloud Native Network 2.0](https://support.huaweicloud.com/intl/en-us/usermanual-cce/cce_10_0284.html)
+13. [Huawei Cloud - CCE Networking Overview](https://support.huaweicloud.com/intl/en-us/usermanual-cce/cce_10_0249.html)
