@@ -77,18 +77,54 @@ spec:
 **Yontem 1 - Node'a EIP Baglama (VPC/Tunnel Ag Modeli):**
 - Huawei Cloud konsolundan node'un bulundugu ECS'ye EIP baglanir
 - Pod'lar, node'un internet baglantisini paylasir
+- Erisim formati: `<Node_EIP>:<NodePort>` (NodePort araligi: 30000-32767)
 
 **Yontem 2 - Pod'a EIP Baglama (Cloud Native 2.0 / CCE Turbo):**
 - CCE Turbo Cluster gerektirir
-- Pod'a dogrudan EIP atanarak bagimsiz internet erisimi saglanir
+- Pod'lar VPC elastic network interface (ENI) kullanir, EIP dogrudan pod'un ag arayuzune baglanir
+- NAT veya tunnel encapsulation overhead'i yoktur
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    yangtse.io/pod-with-eip: "true"
+    yangtse.io/eip-bandwidth-size: "5"          # Mbit/s, varsayilan: 5
+    yangtse.io/eip-network-type: 5_bgp          # Secenekler: 5_bgp, 5_union, 5_sbgp
+    yangtse.io/eip-charge-mode: bandwidth       # Secenekler: bandwidth, traffic
+    yangtse.io/eip-bandwidth-name: "my-bw"
+spec:
+  containers:
+    - name: app
+      image: nginx
+```
+
+Mevcut bir EIP baglamak icin:
+```yaml
+annotations:
+  yangtse.io/eip-id: "<mevcut_eip_id>"
+```
 
 **Yontem 3 - NAT Gateway + SNAT (Onerilen):**
 - Ayni VPC'de NAT Gateway olusturulur
 - EIP, NAT Gateway'e baglanir
 - SNAT kurallari subnet CIDR blogu bazinda tanimlanir
 - Tum pod'lar paylasimli EIP uzerinden internete cikar
+- Yuksek esli baglanti sayisini destekler (NAT Gateway basina 20 Gbit/s'e kadar)
 
-> **Kaynak:** [Huawei Cloud - CCE Pod Internet Access](https://support.huaweicloud.com/intl/en-us/usermanual-cce/cce_10_0400.html)
+**Yontem 4 - LoadBalancer Service ile EIP (ELB):**
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    kubernetes.io/elb.autocreate: '{"type":"public","bandwidth_size":5,"eip_type":"5_bgp"}'
+spec:
+  type: LoadBalancer
+```
+
+> **Kaynak:** [Huawei Cloud - CCE Pod Internet Access](https://support.huaweicloud.com/intl/en-us/usermanual-cce/cce_10_0400.html), [Huawei Cloud - EIP for Pod in CCE Turbo](https://support.huaweicloud.com/intl/en-us/usermanual-cce/cce_10_0734.html)
 
 ---
 
@@ -162,11 +198,86 @@ spec:
 - Pod seviyesinde EIP yalnizca **Cloud Native 2.0 (CCE Turbo)** ag modelinde desteklenir
 - SNAT kurallari **CIDR blogu bazinda** calisir; pod bazinda granularite saglamaz
 - EIP bant genisligi siniri mevcuttur (inbound <=10 Mbit/s ise 10 Mbit/s'ye kadar)
+- Pod EIP annotation'lari **pod olusturulduktan sonra degistirilemez** - pod yeniden olusturulmalidir
+- Otomatik tahsis edilen EIP manuel silinirse pod'un agi bozulur, pod yeniden olusturulmalidir
+- Pod basina **maksimum 1 EIP** atanabilir
+- ECS sub-ENI baglama hizi limiti: tenant bazinda **600 pod/dakika**
+- BMS ENI baglama suresi: **20-30 saniye**, node basina **3 esli** pod olusturma limiti
 - Ek maliyet: EIP + bant genisligi kullanim ucreti
 
 ---
 
-## 8. Kullanim Senaryolari Karsilastirmasi
+## 8. Huawei CCE: NAT Gateway vs Dogrudan EIP Karsilastirmasi
+
+| Kriter | NAT Gateway (SNAT) | Dogrudan EIP (Node/Pod) |
+|--------|---------------------|-------------------------|
+| **Paylasim Modeli** | Cok sayida pod tek/birden fazla EIP'yi paylasir | Her node/pod kendi EIP'sine sahiptir |
+| **Esli Baglanti** | Yuksek - buyuk olcekli esli baglanti icin tasarlanmis | Bireysel EIP bant genisligi ile sinirli |
+| **Maks Bant Genisligi** | NAT Gateway basina 20 Gbit/s'e kadar | EIP bazinda bant genisligi limiti |
+| **Ag Modeli** | Tumu (Tunnel, VPC, Cloud Native 2.0) | Node EIP: tum modeller; Pod EIP: yalnizca Cloud Native 2.0 |
+| **Maliyet Verimliligi** | Cok pod icin tek EIP (ekonomik) | Pod/node basina EIP (olcekte pahali) |
+| **Oncelik Kurali** | Hem EIP hem NAT Gateway varsa, trafik EIP uzerinden cikar | - |
+| **Kisitlama** | VPC basina bir NAT Gateway; subnet basina bir SNAT kurali | Pod EIP: pod basina maks 1 EIP |
+
+> **Kaynak:** [Huawei Cloud - CCE Pod Internet Access](https://support.huaweicloud.com/intl/en-us/usermanual-cce/cce_10_0400.html)
+
+---
+
+## 9. Huawei CCE: Node EIP vs Pod EIP
+
+| Kriter | Node'a EIP Baglama | Pod'a EIP Baglama |
+|--------|-------------------|-------------------|
+| **Ag Modeli** | Tumu (VPC, Tunnel, Cloud Native 2.0) | Yalnizca Cloud Native 2.0 (CCE Turbo) |
+| **Granularite** | Node seviyesi (tum pod'lar paylasir) | Pod seviyesi (pod basina ozel) |
+| **Trafik Yolu** | Node EIP → NodePort → kube-proxy → Pod (olasi cross-node hop) | Dogrudan pod ENI uzerinden (NAT/tunnel yok) |
+| **Performans** | Route yonlendirme nedeniyle performans kaybi olabilir | Daha yuksek performans, encapsulation overhead yok |
+| **EIP Yasam Dongusu** | ECS konsolunda bagimsiz yonetilir | Otomatik tahsis: pod ile silinir; Mevcut EIP: pod silindikten sonra korunur |
+| **Guvenlik** | Tum node internete acilir | Pod bazinda izole; pod bazinda security group mumkun |
+| **Annotation** | Yok (ECS/VPC konsolundan yapilandirilir) | `yangtse.io/pod-with-eip`, `yangtse.io/eip-id` vb. |
+| **Kullanim Alani** | Hizli NodePort erisimi, test ortamlari | Ozel public IP gerektiren production workload'lar |
+
+> **Kaynak:** [Huawei Cloud - EIP for Pod in CCE Turbo](https://support.huaweicloud.com/intl/en-us/usermanual-cce/cce_10_0734.html)
+
+---
+
+## 10. Teknik Spesifikasyonlar
+
+### OpenShift Egress IP
+
+| Spesifikasyon | Deger |
+|---------------|-------|
+| **CNI Eklentisi** | OVN-Kubernetes (veya OpenShift SDN) |
+| **CRD** | `EgressIP` (k8s.ovn.org/v1) |
+| **Node Etiketi** | `k8s.ovn.org/egress-assignable=""` |
+| **IP Protokolu** | IPv4 + IPv6 (Dual-Stack) |
+| **AWS IP Limiti** | Instance tipine gore degisir |
+| **GCP IP Limiti** | Node basina 100 alias, VPC basina ~15.000 |
+| **Azure IP Limiti** | NIC basina 256, sanal ag basina 65.536 |
+| **Failover** | Otomatik (OVN-Kubernetes yonetiminde) |
+| **Scope** | Cluster-scoped kaynak |
+
+### Huawei Cloud CCE EIP
+
+| Spesifikasyon | Deger |
+|---------------|-------|
+| **EIP Tipleri** | `5_bgp` (Dynamic BGP), `5_sbgp` (Static BGP), `5_union`, `5_telcom` |
+| **Varsayilan Bant Genisligi** | 5 Mbit/s |
+| **Maks Bant Genisligi (LB)** | 1-2000 Mbit/s (bolgeye bagli) |
+| **NAT Gateway Maks Bant Genisligi** | 20 Gbit/s |
+| **Ucretlendirme Modlari** | Bant genisligine gore, trafige gore |
+| **Pod Basina Maks EIP** | 1 |
+| **Pod EIP Min Cluster Versiyonlari** | v1.19.16-r20, v1.21.10-r0, v1.23.8-r0, v1.25.3-r0+ |
+| **Mevcut EIP Baglama Min Versiyonlari** | v1.23.16-r0, v1.25.11-r0, v1.27.8-r0, v1.28.6-r0, v1.29.2-r0+ |
+| **Cloud Native 2.0 Maks Olcek** | 2.000 ECS node, 100.000 pod/cluster |
+| **ENI Olusturma Hizi (ECS)** | ~1 saniye |
+| **ENI Olusturma Hizi (BMS)** | 20-30 saniye |
+| **NodePort Araligi** | 30000-32767 |
+
+> **Kaynak:** [Huawei Cloud - EIP for Pod in CCE Turbo](https://support.huaweicloud.com/intl/en-us/usermanual-cce/cce_10_0734.html)
+
+---
+
+## 11. Kullanim Senaryolari Karsilastirmasi
 
 | Senaryo | OpenShift Egress IP | Huawei CCE EIP |
 |---------|---------------------|----------------|
@@ -178,7 +289,7 @@ spec:
 
 ---
 
-## 9. Ozet
+## 12. Ozet
 
 **OpenShift Egress IP**, Kubernetes-native bir cozum olarak cluster icinde tanimlanan CRD'ler araciligiyla yonetilir ve ozellikle coklu platform destegi, namespace/pod bazinda ince granularite ve otomatik failover sunmasi ile one cikar. Ek bir cloud servisi gerektirmez.
 
@@ -196,3 +307,6 @@ Her iki cozum de ayni temel ihtiyaci karsilar: **konteyner trafiginiin dis dunya
 4. [OpenShift Docs Source - nw-egress-ips-node.adoc](https://github.com/openshift/openshift-docs/blob/main/modules/nw-egress-ips-node.adoc)
 5. [Huawei Cloud - EIP Product Description](https://support.huaweicloud.com/intl/en-us/productdesc-eip/overview_0001.html)
 6. [Huawei Cloud - CCE Pod Internet Access](https://support.huaweicloud.com/intl/en-us/usermanual-cce/cce_10_0400.html)
+7. [Huawei Cloud - Configuring EIP for Pod in CCE Turbo](https://support.huaweicloud.com/intl/en-us/usermanual-cce/cce_10_0734.html)
+8. [Huawei Cloud - Cloud Native Network 2.0](https://support.huaweicloud.com/intl/en-us/usermanual-cce/cce_10_0284.html)
+9. [Huawei Cloud - CCE Networking Overview](https://support.huaweicloud.com/intl/en-us/usermanual-cce/cce_10_0249.html)
