@@ -189,6 +189,7 @@ spec:
 | **Kapsam** | Cluster-internal networking ozelligi | Cloud-level networking servisi |
 | **Yonetim Katmani** | Kubernetes CRD (EgressIP objesi) | Cloud konsolu, API + Kubernetes annotation |
 | **IP Atama** | Mevcut node IP havuzundan otomatik atama | Cloud'dan bagimsiz EIP satin alma/tahsis |
+| **Subnet Kisiti** | Egress IP, node'un birincil ag arayuzu ile **ayni subnet'te olmak zorunda** (bare metal secondary NIC harici) | Boyle bir kisit yok - EIP, Huawei Cloud public IP havuzundan bagimsiz olarak tahsis edilir; node/pod subnet'inden bagimsizdir |
 | **Granularite** | Namespace + Pod label selector ile ince ayar | Node-level veya Pod-level (Cloud Native 2.0) |
 | **Failover** | OVN-Kubernetes otomatik IP migrasyonu (node arasi) | Cloud altyapisi tarafindan yonetilir |
 | **Maliyet Modeli** | Cluster kaynagi - ek maliyet yok | EIP + bant genisligi icin ayri faturalandirma |
